@@ -1,0 +1,403 @@
+#!/bin/bash
+
+# Automated Incident Response System (Bash version)
+# Требования: Bash 4+, sudo для команд (iptables, kill и т.д.)
+
+# Создаем необходимые директории
+mkdir -p logs playbooks /quarantine /backup
+
+LOG_FILE="logs/air_system.log"
+declare -a rollback_stack  # Массив для отката
+
+# Функция логирования
+function log() {
+    local level="$1"
+    local message="$2"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] [$level] $message" | tee -a "$LOG_FILE"
+}
+
+# Функция эскалации
+function escalate() {
+    local message="$1"
+    local confidence="$2"
+    log "warning" "Escalating due to low confidence ($confidence): $message"
+    # Отправка email (требует настройки mail; замените на реальный адрес)
+    if command -v mail >/dev/null 2>&1; then
+        echo "$message" | mail -s "AIR Escalation" operator@company.com 2>/dev/null || log "error" "Failed to send email"
+    else
+        log "info" "Email notification: $message"
+    fi
+}
+
+# Функция выполнения действия с откатом
+function execute_action() {
+    local action="$1"
+    shift
+    local params="$@"
+    log "info" "Executing action: $action with params: $params"
+    
+    case "$action" in
+        block_ip)
+            local ip="$1"
+            if sudo iptables -A INPUT -s "$ip" -j DROP 2>/dev/null; then
+                rollback_stack+=("unblock_ip $ip")
+                log "info" "Successfully blocked IP: $ip"
+            else
+                log "error" "Failed to block IP: $ip"
+            fi
+            ;;
+        unblock_ip)
+            local ip="$1"
+            sudo iptables -D INPUT -s "$ip" -j DROP 2>/dev/null && log "info" "Unblocked IP: $ip"
+            ;;
+        isolate_process)
+            local pid="$1"
+            if kill -STOP "$pid" 2>/dev/null; then
+                rollback_stack+=("resume_process $pid")
+                log "info" "Process isolated (stopped): $pid"
+                
+                # Memory dump если gcore доступен
+                if command -v gcore >/dev/null 2>&1; then
+                    gcore "$pid" 2>/dev/null && log "info" "Memory dump created for PID: $pid" || log "error" "gcore failed for PID $pid"
+                else
+                    # Альтернатива: сохранить информацию о процессе
+                    ps -p "$pid" > "logs/process_${pid}_info.txt" 2>/dev/null
+                    log "info" "Process info saved for PID: $pid"
+                fi
+            else
+                log "error" "Failed to isolate process: $pid"
+            fi
+            ;;
+        resume_process)
+            local pid="$1"
+            kill -CONT "$pid" 2>/dev/null && log "info" "Process resumed: $pid"
+            ;;
+        quarantine_file)
+            local file="$1"
+            if [[ -f "$file" ]]; then
+                sudo mv "$file" "/quarantine/$(basename "$file")" 2>/dev/null
+                if [[ $? -eq 0 ]]; then
+                    rollback_stack+=("restore_file $file")
+                    log "info" "File quarantined: $file"
+                else
+                    log "error" "Failed to quarantine file: $file"
+                fi
+            else
+                log "error" "File not found: $file"
+            fi
+            ;;
+        restore_file)
+            local file="$1"
+            local filename=$(basename "$file")
+            if [[ -f "/quarantine/$filename" ]]; then
+                sudo mv "/quarantine/$filename" "$file" 2>/dev/null && log "info" "File restored: $file"
+            else
+                log "error" "Quarantined file not found: /quarantine/$filename"
+            fi
+            ;;
+        restore_from_backup)
+            local file="$1"
+            local filename=$(basename "$file")
+            if [[ -f "/backup/$filename" ]]; then
+                sudo cp "/backup/$filename" "$file" 2>/dev/null && log "info" "File restored from backup: $file"
+            else
+                log "error" "Backup file not found: /backup/$filename"
+            fi
+            ;;
+        kill_process)
+            local pid="$1"
+            if kill -9 "$pid" 2>/dev/null; then
+                log "info" "Process killed:
+                : $
+                pid"
+            else
+                log "error" "Failed to kill process: $pid"
+            fi
+            ;;
+        block_pools)
+            local pool="$1"
+            if ! grep -q "127.0.0.1 $pool" /etc/hosts 2>/dev/null; then
+                echo "127.0.0.1 $pool" | sudo tee -a /etc/hosts >/dev/null
+                if [[ $? -eq 0 ]]; then
+                    rollback_stack+=("unblock_pools $pool")
+                    log "info" "Pool blocked: $pool"
+                else
+                    log "error" "Failed to block pool: $pool"
+                fi
+            fi
+            ;;
+        unblock_pools)
+            local pool="$1"
+            sudo sed -i "/127.0.0.1 $pool/d" /etc/hosts 2>/dev/null && log "info" "Pool unblocked: $pool"
+            ;;
+        notify)
+            local msg="$1"
+            log "info" "Notification: $msg"
+            ;;
+        *)
+            log "error" "Unknown action: $action"
+            return 1
+            ;;
+    esac
+}
+
+# Создаем плейбуки
+function create_playbooks() {
+    # Плейбук для brute force атак
+    cat > playbooks/brute_force.sh << 'EOF'
+PLAYBOOK_NAME="Brute Force Response"
+CONFIDENCE_THRESHOLD=0.8
+
+step_1() {
+    local ip="$1"
+    execute_action "block_ip" "$ip"
+    execute_action "notify" "Brute force attack detected from $ip - IP blocked"
+}
+
+step_2() {
+    local ip="$1"
+    # Дополнительные действия: логирование, отчеты
+    log "info" "Brute force response completed for IP: $ip"
+}
+EOF
+
+    # Плейбук для подозрительных процессов
+    cat > playbooks/suspicious_process.sh << 'EOF'
+PLAYBOOK_NAME="Suspicious Process Response"
+CONFIDENCE_THRESHOLD=0.7
+
+step_1() {
+    local pid="$1"
+    execute_action "isolate_process" "$pid"
+    execute_action "notify" "Suspicious process detected: PID $pid - Process isolated"
+}
+
+step_2() {
+    local pid="$1"
+    # Сбор дополнительной информации
+    if command -v lsof >/dev/null 2>&1; then
+        lsof -p "$pid" > "logs/process_${pid}_lsof.txt" 2>/dev/null
+    fi
+    if command -v ps >/dev/null 2>&1; then
+        ps -f -p "$pid" > "logs/process_${pid}_ps.txt" 2>/dev/null
+    fi
+}
+
+step_3() {
+    local pid="$1"
+    # При высокой уверенности - завершить процесс
+    execute_action "kill_process" "$pid"
+}
+EOF
+
+    # Плейбук для изменений критических файлов
+    cat > playbooks/critical_file_change.sh << 'EOF'
+PLAYBOOK_NAME="Critical File Change Response"
+CONFIDENCE_THRESHOLD=0.9
+
+step_1() {
+    local file="$1"
+    execute_action "quarantine_file" "$file"
+    execute_action "notify" "Critical file change detected: $file - File quarantined"
+}
+
+step_2() {
+    local file="$1"
+    execute_action "restore_from_backup" "$file"
+}
+
+step_3() {
+    local file="$1"
+    # Проверка целостности восстановленного файла
+    if [[ -f "$file" ]]; then
+        log "info" "File restored and verified: $file"
+    else
+        log "error" "Failed to restore file: $file"
+    fi
+}
+EOF
+
+    # Плейбук для crypto miners
+    cat > playbooks/crypto_miner.sh << 'EOF'
+PLAYBOOK_NAME="Crypto Miner Response"
+CONFIDENCE_THRESHOLD=0.95
+
+step_1() {
+    local pid="$1"
+    local pool="$2"
+    execute_action "kill_process" "$pid"
+    execute_action "block_pools" "$pool"
+    execute_action "notify" "Crypto miner detected: PID $pid, Pool $pool - Process killed, pool blocked"
+}
+
+step_2() {
+    local pid="$1"
+    local pool="$2"
+    # Дополнительные проверки
+    log "info" "Crypto miner cleanup completed for PID: $pid"
+}
+EOF
+
+    log "info" "Playbooks created successfully"
+}
+
+# Функция запуска плейбука
+function run_playbook() {
+    local playbook_file="$1"
+    local context="$2"  # Простой формат: key=value,key2=value2
+    local confidence="$3"
+
+    # Загружаем плейбук
+    if [[ ! -f "$playbook_file" ]]; then
+        log "error" "Playbook not found: $playbook_file"
+        return 1
+    fi
+    
+    source "$playbook_file" 2>/dev/null || { log "error" "Failed to load playbook: $playbook_file"; return 1; }
+
+    log "info" "Running playbook: $PLAYBOOK_NAME"
+
+    # Проверяем уверенность (используем bc для дробных чисел, если доступен)
+    if command -v bc >/dev/null 2>&1; then
+        if (( $(echo
+        "$confidence < $CONFIDENCE_THRESHOLD" | bc -l 2>/dev/null) )); then
+            escalate "$PLAYBOOK_NAME" "$confidence"
+            return  # Эскалация
+        fi
+    else
+        # Простая проверка если bc не доступен
+        if [[ $(echo "$confidence < $CONFIDENCE_THRESHOLD" | awk '{print ($1 < $2)}') -eq 1 ]]; then
+            escalate "$PLAYBOOK_NAME" "$confidence"
+            return
+        fi
+    fi
+
+    # Парсим контекст
+    declare -A context_map
+    IFS=',' read -ra KV_PAIRS <<< "$context"
+    for kv in "${KV_PAIRS[@]}"; do
+        IFS='=' read -r key value <<< "$kv"
+        context_map["$key"]="$value"
+    done
+
+    # Выполняем шаги
+    local step_num=1
+    while declare -f "step_$step_num" >/dev/null; do
+        log "info" "Executing step $step_num"
+        
+        # Подготавливаем аргументы для шага
+        local args=""
+        for key in "${!context_map[@]}"; do
+            args="$args ${context_map[$key]}"
+        done
+        
+        # Вызываем шаг с аргументами
+        if ! "step_$step_num" $args; then
+            log "error" "Step $step_num failed"
+            return 1
+        fi
+        ((step_num++))
+    done
+    
+    log "info" "Playbook completed successfully: $PLAYBOOK_NAME"
+}
+
+# Функция обнаружения и реагирования
+function detect_and_respond() {
+    local incident_type="$1"
+    local context="$2"
+    local confidence="${3:-1.0}"
+    local playbook_file="playbooks/${incident_type}.sh"
+
+    log "info" "Detected incident: $incident_type with context: $context, confidence: $confidence"
+    
+    if [[ -f "$playbook_file" ]]; then
+        run_playbook "$playbook_file" "$context" "$confidence"
+    else
+        log "error" "No playbook found for $incident_type"
+        return 1
+    fi
+}
+
+# Функция отката
+function rollback() {
+    log "info" "Rolling back actions (${#rollback_stack[@]} actions to rollback)"
+    for ((i=${#rollback_stack[@]}-1; i>=0; i--)); do
+        local cmd="${rollback_stack[i]}"
+        log "info" "Rollback: $cmd"
+        # Разделяем команду и аргументы
+        read -r action args <<< "$cmd"
+        execute_action "$action" $args
+    done
+    rollback_stack=()  # Очищаем стек
+    log "info" "Rollback completed"
+}
+
+# Функция показа статуса
+function show_status() {
+    echo "=== Automated Incident Response System Status ==="
+    echo "Log file: $LOG_FILE"
+    echo "Playbooks directory: $(ls playbooks/ 2>/dev/null | wc -l) playbooks"
+    echo "Rollback stack: ${#rollback_stack[@]} actions"
+    echo "Quarantine directory: $(ls /quarantine 2>/dev/null | wc -l) files"
+    echo "================================================="
+}
+
+# Главное меню
+function main() {
+    case "${1:-}" in
+        --test)
+            echo "Running test scenarios..."
+            # Тестовые сценарии
+            detect_and_respond "brute_force" "ip=192.168.1.100" 0.9
+            detect_and_respond "suspicious_process" "pid=9999" 0.7
+            detect_and_respond "critical_file_change" "file=/etc/test.conf" 1.0
+            detect_and_respond "crypto_miner" "pid=8888,pool=miningpool.com" 0.95
+            ;;
+        --rollback)
+            rollback
+            ;;
+        --status)
+            show_status
+            ;;
+        --create-playbooks)
+            create_playbooks
+            ;;
+        --respond)
+            if [[ -z "$2" ]] || [[ -z "$3" ]]; then
+                echo "Usage: $0 --respond INCIDENT_TYPE CONTEXT [CONFIDENCE]"
+                echo "Example: $0 --respond brute_force ip=192.168.1.100 0.9"
+                return 1
+            fi
+            detect_and_respond "$2" "$3" "$4"
+            ;;
+        *)
+            echo "Automated Incident Response System"
+            echo ""
+            echo "Usage: $0 [OPTION]"
+            echo ""
+            echo "Options:"
+            echo "  --test              Run test scenarios"
+            echo "  --rollback          Rollback all actions"
+            echo "  --status            Show system status"
+            echo "  --create-playbooks  Create default playbooks"
+            echo "  --respond           Respond to specific incident"
+            echo ""
+            echo "Examples:"
+            echo "  $0 --create-playbooks"
+            echo "  $0 --test"
+            echo "  $0 --respond brute_force ip=192.168.1.100 0.9"
+            echo "  $0 --rollback"
+            ;;
+    esac
+}
+
+# Запуск главной функции
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    # Создаем необходимые директории при первом запуске
+    mkdir -p logs playbooks
+    sudo mkdir -p /quarantine /backup 2>/dev/null || true
+    
+    main "$@"
+fi

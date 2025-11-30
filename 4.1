@@ -1,0 +1,53 @@
+#!/bin/bash
+
+while true; do
+  clear
+  echo "=== Панель безопасности ==="
+  echo "Время: $(date)"
+  echo "--------------------------"
+
+  echo -e "\033[1;34m[События безопасности]\033[0m"
+  journalctl -n 5 -p warning --no-pager
+
+  echo -e "\033[1;32m[Состояние системы]\033[0m"
+  top -b -n 1 | head -n 5
+
+  echo -e "\033[1;36m[Сетевой трафик]\033[0m"
+  ss -tunap | head -n 5
+
+  # Пример цветового индикатора угроз:
+  threat_count=$(journalctl -p warning | grep "failed password" | wc -l)
+  if (( threat_count > 10 )); then
+    echo -e "\033[41;97m ВЫСОКИЙ УРОВЕНЬ УГРОЗЫ: $threat_count \033[0m"
+  elif (( threat_count > 3 )); then
+    echo -e "\033[43;30m СРЕДНИЙ УРОВЕНЬ УГРОЗЫ: $threat_count \033[0m"
+  else
+    echo -e "\033[42;30m НИЗКИЙ УРОВЕНЬ УГРОЗЫ: $threat_count \033[0m"
+  fi
+
+  echo -e "\033[1;33m[Действия]\033[0m"
+  echo "1) Заблокировать IP  2) Перезапустить сервис  3) Экспорт отчёта"
+  read -t 5 -n 1 choice
+
+  case $choice in
+    1) 
+      echo "Введите IP для блокировки:"
+      read ip
+      sudo iptables -A INPUT -s $ip -j DROP
+      echo "IP $ip заблокирован"
+      sleep 2
+      ;;
+    2) 
+      echo "Введите имя сервиса для перезапуска:"
+      read svc
+      sudo systemctl restart $svc
+      echo "Сервис $svc перезапущен"
+      sleep 2
+      ;;
+    3) 
+      journalctl -p warning > report_$(date +%F).txt
+      echo "Отчёт сохранён в report_$(date +%F).txt"
+      sleep 2
+      ;;
+  esac
+done
